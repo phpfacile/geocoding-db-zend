@@ -7,6 +7,11 @@ use Zend\Db\Sql\Sql;
 class LocationService
 {
     /**
+     * @var Adapater
+     */
+    protected $adapter;
+
+    /**
      * The constructor
      *
      * @param AdapterInterface $adapter Adapter for the database
