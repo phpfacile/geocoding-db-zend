@@ -11,6 +11,8 @@ class LocationService
      */
     protected $adapter;
 
+    protected $openstreetmapService;
+
     /**
      * The constructor
      *
@@ -23,85 +25,30 @@ class LocationService
         $this->adapter = $adapter;
     }
 
-    /**
-     * Returns the query part (i.e. fields used to perform the geocoding query)
-     * of a location returned by phpfacile/geocoding
-     *
-     * @param StdClass $location Location
-     *
-     * @return array
-     */
-    protected static function getQueryPartFromStdClass($location)
+    public function setOpenstreetmapService($openstreetmapService)
     {
-        // TODO Take into account locale ?
-        $values = [];
-
-        $geocodedData = $location->geocoding;
-
-        // Fields for the query part
-        // ==========================
-        // name is empty if location is a place
-        if (true === property_exists($location, 'name')) {
-            $values['name'] = $location->name;
-        }
-
-        $values['place'] = $location->place;
-
-        // Not clear whether postalCode must be taken into account or not
-        // For exemple, with Paris we (currently) want to ignore the postal
-        // code so as to make no "arrondissement" distinction.
-        // This is the case for all other large cities.
-        // But in some cases (small towns with the same name in different departement)
-        // the postal code is required to distinguish them
-        if (true === property_exists($location, 'postalCode')) {
-            $values['postal_code'] = $location->postalCode;
-        } else {
-            // If it was not set during the 1st query
-            // maybe the user then selected between 2 small towns
-            // then to avoid confusion we have to keep the selected postal code
-            // REM: Must this be done here? Or at the calling method ?
-            $values['postal_code'] = $geocodedData->postalCode;
-        }
-
-        $values['country'] = $location->country->name;
-
-        if (true === property_exists($location->country, 'isocode')) {
-            $values['country_isocode'] = $location->country->isocode;
-        } else {
-            $values['country_isocode'] = $geocodedData->country->isoCode;
-        }
-
-        return $values;
+        $this->openstreetmapService = $openstreetmapService;
     }
 
     /**
-     * Returns the id in the database of the location
+     * Returns the id in the database of the geocoded location
      *
-     * @param StdClass $location Location as returned by phpfacile/geocoding
+     * @param StdClass $geocodedLocation  Geocoded location as returned by phpfacile/geocoding
      *
-     * @throws Exception In case the location is not found or if there are several matches
+     * @throws Exception In case the geocoded location is not found or if there are several matches
      *
      * @return string Id in the database
      */
-    public function getStdClassLocationId($location)
+    public function getGeocoderLocationIdFromGeocodedPlaceStdClass($geocodedLocation)
     {
-        $queryFieldValues = self::getQueryPartFromStdClass($location);
-
         $where = [
-            'place'           => $queryFieldValues['place'],
-            'postal_code'     => $queryFieldValues['postal_code'],
-            'country_isocode' => $queryFieldValues['country_isocode'],
+            'geocoding_provider'   => $geocodedLocation->geocoding->provider,
+            'geocoder_object_id' => $geocodedLocation->geocoding->idProvider,
         ];
-
-        if (true === array_key_exists('name', $queryFieldValues)) {
-            $where['name'] = $queryFieldValues['name'];
-        } else {
-            $where['name'] = null;
-        }
 
         $sql   = new Sql($this->adapter);
         $query = $sql
-            ->select('locations')
+            ->select('geocoder_locations')
             ->columns(['id'])
             ->where($where);
         $stmt  = $sql->prepareStatementForSqlObject($query);
@@ -118,69 +65,171 @@ class LocationService
     }
 
     /**
-     * Saves into database a location described as a StdClass
+     * Saves into database a geocoder location (i.e. location data provided by a geocoder)
+     * found in a geocoded location described as a StdClass
      * REM: Attributes validity checking is not in the scope of this method and must be performed by the calling method
      *
-     * @param StdClass $location          A class with geocoder, name, location, postalCode, coordinates (latitude, longitude), country, etc.
-     * @param boolean  $includesQueryPart Whether or not the $location includes the query part (ignored)
+     * @param StdClass $geocodedLocation  Geocoded location as returned by phpfacile/geocoding
      *
-     * @return integer Id of the location in the database
+     * @return integer Id of the geocoder location in the database
      */
-    public function insertStdClassLocation($location, $includesQueryPart = true)
+    public function insertGeocoderLocationOfGeocodedPlaceStdClass($geocodedLocation)
     {
-        // Fields for the query part
-        // ==========================
-        $values = self::getQueryPartFromStdClass($location);
-
-        // Fields for the geocoded part
-        // ============================
-        $geocodedData = $location->geocoding;
-        $values['geocoding_datetime_utc']   = $geocodedData->dateTimeUTC;
-        $values['geocoding_provider']       = $geocodedData->provider;
-        $values['geocoded_location_id']     = $geocodedData->idProvider;
-        $values['geocoded_name']            = $geocodedData->name;
-        $values['geocoded_locality']        = $geocodedData->locality;
-        $values['geocoded_postal_code']     = $geocodedData->postalCode;
-        $values['geocoded_latitude']        = $geocodedData->coordinates->latitude;
-        $values['geocoded_longitude']       = $geocodedData->coordinates->longitude;
-        $values['geocoded_country_isocode'] = $geocodedData->country->isoCode;
-        $values['geocoded_timezone']        = $geocodedData->timezone;
+        /*
+            1st step - Actually store the geocoder location data
+        */
+        $geocoding = $geocodedLocation->geocoding;
+        $values['geocoding_datetime_utc']   = $geocoding->geocodingDateTimeUTC;
+        $values['geocoding_provider']       = $geocoding->provider;
+        $values['geocoder_object_id']       = $geocoding->idProvider;
+        $values['geocoded_latitude']        = $geocoding->coordinates->latitude;
+        $values['geocoded_longitude']       = $geocoding->coordinates->longitude;
+        $values['geocoded_country_code'] = $geocoding->country->isoCode;
+        $values['geocoded_timezone']        = $geocoding->timezone;
 
         $sql   = new Sql($this->adapter);
         $query = $sql
-            ->insert('locations')
+            ->insert('geocoder_locations')
             ->values($values);
         $stmt  = $sql->prepareStatementForSqlObject($query);
         $stmt->execute();
 
-        return $this->adapter->getDriver()->getLastGeneratedValue();
-    }
+        $geocoderDataId = $this->adapter->getDriver()->getLastGeneratedValue();
 
-    /**
-     * Try to get the Id of the location in case the location is already in database
-     * otherwise strore the location in the database
-     *
-     * @param StdClass $location          Location as returned by phpfacile/geocoding
-     * @param boolean  $includesQueryPart Whether or not the $location includes the query part (ignored)
-     *
-     * @throws Exception In case of error
-     *
-     * @return string|integer Id of the location in the database
-     */
-    public function getIdOfStdClassLocationAfterInsertIfNeeded($location, $includesQueryPart = true)
-    {
+        /*
+            2nd step - If possible store additionnal data for potential use
+            in future. So as to be able to geocode places with (almost) no more
+            external geocoder API call.
+        */
+        switch ($geocodedLocation->geocoding->provider) {
+            case 'nominatim':
+                $relation         = $this->openstreetmapService->getRelationById($geocodedLocation->geocoding->idProvider);
+                $officialName     = $relation->getOfficialName();
+                $placeNames       = $relation->getNames();
+                $placePostalCodes = $relation->getPostalCodes();
+                // TODO Not sure this is the best way to retrieve the country code
+                $countryCode = $geocodedLocation->country->code;
+                if (1 === count($placePostalCodes)) {
+                    $keptPostalCode = $placePostalCodes[0];
+                } else {
+                    // probably several postal codes for the same area
+                    $keptPostalCode = null;
+                }
+                break;
+            default:
+                throw new \Exception('Oups... Unable to get official names, postal codes, etc with geocoding provider ['.$geocodedLocation->geocoding->provider.']');
+        }
+
+        // Is there already a place pointing to the same geocoder provider/idProvider
+        // or with same name and postal code in the same country?
         try {
-            $id = $this->getStdClassLocationId($location);
+            $placeId = $this->getIdOfPlaceByNamePostalCodeCountryCodeEtc($officialName, $keptPostalCode, $countryCode, $geocodedLocation->geocoding->provider, $geocodedLocation->geocoding->idProvider);
         } catch (\Exception $e) {
             // TODO replace with a NotFoundException
             if ('Not found' === $e->getMessage()) {
                 // Ok insert
-                $id = $this->insertStdClassLocation($location, $includesQueryPart);
+                $values = [];
+                $values['name']                      = $officialName;
+                $values['postal_code']               = $keptPostalCode;
+                $values['country_code']              = $countryCode;
+                $values['best_geocoder_location_id'] = $geocoderDataId;
+
+                $sql   = new Sql($this->adapter);
+                $query = $sql
+                    ->insert('places')
+                    ->values($values);
+                $stmt  = $sql->prepareStatementForSqlObject($query);
+                $stmt->execute();
+
+                $placeId = $this->adapter->getDriver()->getLastGeneratedValue();
+            } else {
+                throw new \Exception('Failure', 0, $e);
+            }
+        }
+
+        // TODO Store alternative names
+        // TODO Store all zipcodes
+
+        $sql   = new Sql($this->adapter);
+        $query = $sql
+            ->update('geocoder_locations')
+            ->set(
+                ['place_id' => $placeId]
+            )
+            ->where(['id' => $geocoderDataId]);
+        $stmt  = $sql->prepareStatementForSqlObject($query);
+        $stmt->execute();
+
+        return $geocoderDataId;
+    }
+
+    /**
+     * Tries to get the Id of the geocoded location if the location is already in database.
+     * Otherwise stores the geocoded location in the database
+     *
+     * @param StdClass $geocodedPlace Geocoded location (where location is a place) as returned by phpfacile/geocoding
+     *
+     * @throws Exception In case of error
+     *
+     * @return string|integer Id of the geocoded location in the database
+     */
+    public function getGeocoderLocationIdFromGeocodedPlaceStdClassAfterInsertIfNeeded($geocodedLocation)
+    {
+        try {
+            $id = $this->getGeocoderLocationIdFromGeocodedPlaceStdClass($geocodedLocation);
+        } catch (\Exception $e) {
+            // TODO replace with a NotFoundException
+            if ('Not found' === $e->getMessage()) {
+                // Ok insert
+                $id = $this->insertGeocoderLocationOfGeocodedPlaceStdClass($geocodedLocation);
             } else {
                 throw new \Exception('Failure', 0, $e);
             }
         }
 
         return $id;
+    }
+
+    public function getIdOfPlaceByNamePostalCodeCountryCodeEtc($officialName, $keptPostalCode, $countryCode, $geocoder, $geocoderObjectId)
+    {
+        // 1st step - Attempt to query by geocoder/geocoderObjectId
+        //----------------------------------------------------------
+        $sql   = new Sql($this->adapter);
+        $query = $sql
+            ->select('places')
+            ->columns(['place_id' => 'id'])
+            ->join(
+                'geocoder_locations',
+                'places.best_geocoder_location_id=geocoder_locations.id',
+                []
+            )
+            ->where([
+                'geocoding_provider'   => $geocoder,
+                'geocoder_object_id' => $geocoderObjectId,
+            ]);
+        $stmt = $sql->prepareStatementForSqlObject($query);
+        $rows = $stmt->execute();
+        if (false !== ($row = $rows->current())) {
+            return $row['place_id'];
+        }
+
+        // 2nd step - try by official name, kept postal code and country code
+        //-------------------------------------------------------------------
+        $sql   = new Sql($this->adapter);
+        $query = $sql
+            ->select('places')
+            ->columns(['place_id' => 'id'])
+            ->where([
+                'name'         => $officialName,
+                'postal_code'  => $keptPostalCode,
+                'country_code' => $countryCode,
+            ]);
+        $stmt = $sql->prepareStatementForSqlObject($query);
+        $rows = $stmt->execute();
+        if (false !== ($row = $rows->current())) {
+            return $row['place_id'];
+        }
+
+        throw new \Exception('Not found');
     }
 }
