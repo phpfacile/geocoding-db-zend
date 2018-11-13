@@ -1,1 +1,3 @@
+1.0.2 (2018-11-13)
+-------
 * EVOL Locations table is now splitted into geocoder_locations (non localized data from geocoder), places (official names retrieved from openstreetmap), place_names and place_postal_codes (theses 2 last tables are not populated in this release)* EVOL Locations table is now splitted into geocoder_locations (non localized data from geocoder), places (official names retrieved from openstreetmap), place_names and place_postal_codes (theses 2 last tables are not populated in this release)
