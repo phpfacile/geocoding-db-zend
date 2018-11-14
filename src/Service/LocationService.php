@@ -1,13 +1,18 @@
 <?php
 namespace PHPFacile\Geocoding\Db\Service;
 
+use PHPFacile\Openstreetmap\Service\OpenstreetmapServiceInterface;
+
 use Zend\Db\Adapter\AdapterInterface;
 use Zend\Db\Sql\Sql;
+
+use Exceptions\Data\NotFoundException;
+use Exceptions\Data\FoundTooManyException;
 
 class LocationService
 {
     /**
-     * @var Adapater
+     * @var Adapter
      */
     protected $adapter;
 
@@ -25,7 +30,7 @@ class LocationService
         $this->adapter = $adapter;
     }
 
-    public function setOpenstreetmapService($openstreetmapService)
+    public function setOpenstreetmapService(OpenstreetmapServiceInterface $openstreetmapService)
     {
         $this->openstreetmapService = $openstreetmapService;
     }
@@ -35,14 +40,15 @@ class LocationService
      *
      * @param StdClass $geocodedLocation  Geocoded location as returned by phpfacile/geocoding
      *
-     * @throws Exception In case the geocoded location is not found or if there are several matches
+     * @throws NotFoundException     In case the geocoded location is not found
+     * @throws FoundTooManyException If there are several matches
      *
      * @return string Id in the database
      */
     public function getGeocoderLocationIdFromGeocodedPlaceStdClass($geocodedLocation)
     {
         $where = [
-            'geocoding_provider'   => $geocodedLocation->geocoding->provider,
+            'geocoding_provider' => $geocodedLocation->geocoding->provider,
             'geocoder_object_id' => $geocodedLocation->geocoding->idProvider,
         ];
 
@@ -55,10 +61,10 @@ class LocationService
         $rows  = $stmt->execute();
         if (false === ($row = $rows->current())) {
             // TODO replace with a NotFoundException
-            throw new \Exception('Not found');
+            throw new NotFoundException('Geocoder location ['. $geocodedLocation->geocoding->provider.':'.$geocodedLocation->geocoding->idProvider.'] not found');
         } else if (false !== $rows->next()) {
             // TODO replace with a TooManyHitsException
-            throw new \Exception('Too many hits');
+            throw new FoundTooManyException('Too many geocoder locations found for  ['.$geocodedLocation->geocoding->provider.':'.$geocodedLocation->geocoding->idProvider.']');
         }
 
         return $row['id'];
@@ -79,13 +85,13 @@ class LocationService
             1st step - Actually store the geocoder location data
         */
         $geocoding = $geocodedLocation->geocoding;
-        $values['geocoding_datetime_utc']   = $geocoding->geocodingDateTimeUTC;
-        $values['geocoding_provider']       = $geocoding->provider;
-        $values['geocoder_object_id']       = $geocoding->idProvider;
-        $values['geocoded_latitude']        = $geocoding->coordinates->latitude;
-        $values['geocoded_longitude']       = $geocoding->coordinates->longitude;
-        $values['geocoded_country_code'] = $geocoding->country->isoCode;
-        $values['geocoded_timezone']        = $geocoding->timezone;
+        $values['geocoding_datetime_utc'] = $geocoding->geocodingDateTimeUTC;
+        $values['geocoding_provider']     = $geocoding->provider;
+        $values['geocoder_object_id']     = $geocoding->idProvider;
+        $values['geocoded_latitude']      = $geocoding->coordinates->latitude;
+        $values['geocoded_longitude']     = $geocoding->coordinates->longitude;
+        $values['geocoded_country_code']  = $geocoding->country->isoCode;
+        $values['geocoded_timezone']      = $geocoding->timezone;
 
         $sql   = new Sql($this->adapter);
         $query = $sql
@@ -101,16 +107,18 @@ class LocationService
             in future. So as to be able to geocode places with (almost) no more
             external geocoder API call.
         */
+        $placeNames  = [];
+        $postalCodes = [];
         switch ($geocodedLocation->geocoding->provider) {
             case 'nominatim':
-                $relation         = $this->openstreetmapService->getRelationById($geocodedLocation->geocoding->idProvider);
-                $officialName     = $relation->getOfficialName();
-                $placeNames       = $relation->getNames();
-                $placePostalCodes = $relation->getPostalCodes();
-                // TODO Not sure this is the best way to retrieve the country code
+                $relation     = $this->openstreetmapService->getRelationById($geocodedLocation->geocoding->idProvider);
+                $officialName = $relation->getOfficialName();
+                $placeNames   = $relation->getNames();
+                $postalCodes  = $relation->getPostalCodes();
+                // FIXME Not sure this is the best way to retrieve the country code
                 $countryCode = $geocodedLocation->country->code;
-                if (1 === count($placePostalCodes)) {
-                    $keptPostalCode = $placePostalCodes[0];
+                if (1 === count($postalCodes)) {
+                    $keptPostalCode = $postalCodes[0];
                 } else {
                     // probably several postal codes for the same area
                     $keptPostalCode = null;
@@ -124,31 +132,58 @@ class LocationService
         // or with same name and postal code in the same country?
         try {
             $placeId = $this->getIdOfPlaceByNamePostalCodeCountryCodeEtc($officialName, $keptPostalCode, $countryCode, $geocodedLocation->geocoding->provider, $geocodedLocation->geocoding->idProvider);
-        } catch (\Exception $e) {
-            // TODO replace with a NotFoundException
-            if ('Not found' === $e->getMessage()) {
-                // Ok insert
-                $values = [];
-                $values['name']                      = $officialName;
-                $values['postal_code']               = $keptPostalCode;
-                $values['country_code']              = $countryCode;
-                $values['best_geocoder_location_id'] = $geocoderDataId;
+        } catch (NotFoundException $e) {
+            // Ok insert
+            $values = [];
+            $values['name']                      = $officialName;
+            $values['postal_code']               = $keptPostalCode;
+            $values['country_code']              = $countryCode;
+            $values['best_geocoder_location_id'] = $geocoderDataId;
 
-                $sql   = new Sql($this->adapter);
+            $sql   = new Sql($this->adapter);
+            $query = $sql
+                ->insert('places')
+                ->values($values);
+            $stmt  = $sql->prepareStatementForSqlObject($query);
+            $stmt->execute();
+
+            $placeId = $this->adapter->getDriver()->getLastGeneratedValue();
+
+            // Store alternative names
+            foreach ($placeNames as $locale => $name)
+            {
+                if (2 === strlen($locale)) {
+                    // Huho... I really need to find the right way to use prepared statements
+                    $query = $sql
+                        ->insert('place_names')
+                        ->values(
+                            [
+                                'place_id' => $placeId,
+                                'locale'   => $locale,
+                                'name'     => $name,
+                            ]
+                        );
+                    $stmt  = $sql->prepareStatementForSqlObject($query);
+                    $stmt->execute();
+                }
+            }
+
+            // Store all postal codes
+            foreach ($postalCodes as $postalCode)
+            {
+                // Huho... I really need to find the right way to use prepared statements
                 $query = $sql
-                    ->insert('places')
-                    ->values($values);
+                    ->insert('place_postal_codes')
+                    ->values(
+                        [
+                            'place_id'    => $placeId,
+                            'postal_code' => $postalCode,
+                        ]
+                    );
                 $stmt  = $sql->prepareStatementForSqlObject($query);
                 $stmt->execute();
-
-                $placeId = $this->adapter->getDriver()->getLastGeneratedValue();
-            } else {
-                throw new \Exception('Failure', 0, $e);
             }
         }
-
-        // TODO Store alternative names
-        // TODO Store all zipcodes
 
         $sql   = new Sql($this->adapter);
         $query = $sql
@@ -177,14 +212,9 @@ class LocationService
     {
         try {
             $id = $this->getGeocoderLocationIdFromGeocodedPlaceStdClass($geocodedLocation);
-        } catch (\Exception $e) {
-            // TODO replace with a NotFoundException
-            if ('Not found' === $e->getMessage()) {
-                // Ok insert
-                $id = $this->insertGeocoderLocationOfGeocodedPlaceStdClass($geocodedLocation);
-            } else {
-                throw new \Exception('Failure', 0, $e);
-            }
+        } catch (NotFoundException $e) {
+            // Ok insert
+            $id = $this->insertGeocoderLocationOfGeocodedPlaceStdClass($geocodedLocation);
         }
 
         return $id;
@@ -230,6 +260,6 @@ class LocationService
             return $row['place_id'];
         }
 
-        throw new \Exception('Not found');
+        throw new NotFoundException('Place ['.$officialName.'] not found');
     }
 }

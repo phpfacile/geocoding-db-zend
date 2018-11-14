@@ -14,6 +14,8 @@
     "prefer-stable": true,
     "require": {
         "php": ">=7.0.0",
+        "phpfacile/openstreetmap": "^1.0.1",
+        "crazycodr/standard-exceptions": "^2.3",
         "zendframework/zend-db": "^2.5"
     },
     "require-dev": {
